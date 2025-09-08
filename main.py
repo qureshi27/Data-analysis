@@ -906,62 +906,146 @@ Instructions:
     except Exception as e:
         return f"<div class='error'><p>Sorry, I encountered an error while processing your query: {str(e)}</p></div>"
 
-@app.get("/", response_class=HTMLResponse)
+# @app.get("/", response_class=HTMLResponse)
+# async def root():
+#     """Root endpoint with API information"""
+#     html_content = """
+#     <!DOCTYPE html>
+#     <html>
+#     <head>
+#         <title>Batch Data Query API</title>
+#         <style>
+#             body { font-family: Arial, sans-serif; margin: 40px; }
+#             .container { max-width: 800px; margin: 0 auto; }
+#             .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
+#             code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; }
+#         </style>
+#     </head>
+#     <body>
+#         <div class="container">
+#             <h1>Batch Data Query API</h1>
+#             <p>Welcome to the Batch Data Query API. This service allows you to query batch details data using natural language.</p>
+            
+#             <h2>Available Endpoints:</h2>
+            
+#             <div class="endpoint">
+#                 <h3>GET /query</h3>
+#                 <p><strong>Description:</strong> Query batch data using URL parameters</p>
+#                 <p><strong>Parameters:</strong></p>
+#                 <ul>
+#                     <li><code>q</code> (required): Your query string</li>
+#                     <li><code>max_tokens</code> (optional): Maximum tokens for response (default: 1000)</li>
+#                     <li><code>temperature</code> (optional): Response creativity (0.0-1.0, default: 0.7)</li>
+#                 </ul>
+#                 <p><strong>Example:</strong> <code>/query?q=What is the total number of batches?</code></p>
+#             </div>
+            
+#             <div class="endpoint">
+#                 <h3>POST /query</h3>
+#                 <p><strong>Description:</strong> Query batch data using JSON payload</p>
+#                 <p><strong>Body:</strong> JSON with query, max_tokens (optional), temperature (optional)</p>
+#                 <p><strong>Example:</strong></p>
+#                 <pre>{"query": "Show me top 5 batches", "max_tokens": 800, "temperature": 0.5}</pre>
+#             </div>
+            
+#             <h2>Sample Queries:</h2>
+#             <ul>
+#                 <li>What is the total number of batches?</li>
+#                 <li>Show me the top 10 batches</li>
+#                 <li>Give me complete details of batch XYZ</li>
+#                 <li>What are the different batch types?</li>
+#             </ul>
+#         </div>
+#     </body>
+#     </html>
+#     """
+#     return html_content
+
+# @app.get("/query", response_class=HTMLResponse)
+# async def query_get(
+#     q: str = Query(..., description="Query string"),
+#     max_tokens: int = Query(1000, description="Maximum tokens for response"),
+#     temperature: float = Query(0.7, description="Response creativity (0.0-1.0)")
+# ):
+#     """Query endpoint using GET method with URL parameters"""
+#     try:
+#         html_content = await process_query(q, max_tokens, temperature)
+        
+#         # Wrap in a complete HTML document for better display
+#         full_html = f"""
+#         <!DOCTYPE html>
+#         <html>
+#         <head>
+#             <title>Query Result</title>
+#             <style>
+#                 body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }}
+#                 .container {{ max-width: 800px; margin: 0 auto; }}
+#                 .query {{ background: #f0f8ff; padding: 10px; border-radius: 5px; margin-bottom: 20px; }}
+#                 .result {{ background: #ffffff; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }}
+#                 .error {{ color: #d32f2f; background: #ffebee; }}
+#                 .greeting {{ color: #388e3c; background: #e8f5e9; }}
+#                 h4 {{ color: #1976d2; }}
+#                 ul {{ padding-left: 20px; }}
+#             </style>
+#         </head>
+#         <body>
+#             <div class="container">
+#                 <div class="query">
+#                     <strong>Query:</strong> {q}
+#                 </div>
+#                 <div class="result">
+#                     {html_content}
+#                 </div>
+#                 <div style="margin-top: 20px; text-align: center;">
+#                     <a href="/" style="text-decoration: none; background: #1976d2; color: white; padding: 10px 20px; border-radius: 5px;">← Back to API Info</a>
+#                 </div>
+#             </div>
+#         </body>
+#         </html>
+#         """
+#         return full_html
+        
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+@app.get("/")
 async def root():
     """Root endpoint with API information"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Batch Data Query API</title>
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; }
-            .container { max-width: 800px; margin: 0 auto; }
-            .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
-            code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Batch Data Query API</h1>
-            <p>Welcome to the Batch Data Query API. This service allows you to query batch details data using natural language.</p>
-            
-            <h2>Available Endpoints:</h2>
-            
-            <div class="endpoint">
-                <h3>GET /query</h3>
-                <p><strong>Description:</strong> Query batch data using URL parameters</p>
-                <p><strong>Parameters:</strong></p>
-                <ul>
-                    <li><code>q</code> (required): Your query string</li>
-                    <li><code>max_tokens</code> (optional): Maximum tokens for response (default: 1000)</li>
-                    <li><code>temperature</code> (optional): Response creativity (0.0-1.0, default: 0.7)</li>
-                </ul>
-                <p><strong>Example:</strong> <code>/query?q=What is the total number of batches?</code></p>
-            </div>
-            
-            <div class="endpoint">
-                <h3>POST /query</h3>
-                <p><strong>Description:</strong> Query batch data using JSON payload</p>
-                <p><strong>Body:</strong> JSON with query, max_tokens (optional), temperature (optional)</p>
-                <p><strong>Example:</strong></p>
-                <pre>{"query": "Show me top 5 batches", "max_tokens": 800, "temperature": 0.5}</pre>
-            </div>
-            
-            <h2>Sample Queries:</h2>
-            <ul>
-                <li>What is the total number of batches?</li>
-                <li>Show me the top 10 batches</li>
-                <li>Give me complete details of batch XYZ</li>
-                <li>What are the different batch types?</li>
-            </ul>
-        </div>
-    </body>
-    </html>
-    """
-    return html_content
+    return {
+        "title": "Batch Data Query API",
+        "description": "This service allows you to query batch details data using natural language.",
+        "endpoints": {
+            "GET /query": {
+                "description": "Query batch data using URL parameters",
+                "parameters": {
+                    "q": {"type": "string", "required": True, "description": "Your query string"},
+                    "max_tokens": {"type": "integer", "required": False, "default": 1000, "description": "Maximum tokens for response"},
+                    "temperature": {"type": "float", "required": False, "default": 0.7, "description": "Response creativity (0.0-1.0)"}
+                },
+                "example": "/query?q=What is the total number of batches?"
+            },
+            "POST /query": {
+                "description": "Query batch data using JSON payload",
+                "body": {
+                    "query": {"type": "string", "required": True},
+                    "max_tokens": {"type": "integer", "required": False, "default": 1000},
+                    "temperature": {"type": "float", "required": False, "default": 0.7}
+                },
+                "example": {
+                    "query": "Show me top 5 batches",
+                    "max_tokens": 800,
+                    "temperature": 0.5
+                }
+            }
+        },
+        "sample_queries": [
+            "What is the total number of batches?",
+            "Show me the top 10 batches",
+            "Give me complete details of batch XYZ",
+            "What are the different batch types?"
+        ]
+    }
 
-@app.get("/query", response_class=HTMLResponse)
+@app.get("/query")
 async def query_get(
     q: str = Query(..., description="Query string"),
     max_tokens: int = Query(1000, description="Maximum tokens for response"),
@@ -969,44 +1053,29 @@ async def query_get(
 ):
     """Query endpoint using GET method with URL parameters"""
     try:
-        html_content = await process_query(q, max_tokens, temperature)
+        # Process the query (assuming process_query returns plain text or data)
+        result = await process_query(q, max_tokens, temperature)
         
-        # Wrap in a complete HTML document for better display
-        full_html = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Query Result</title>
-            <style>
-                body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }}
-                .container {{ max-width: 800px; margin: 0 auto; }}
-                .query {{ background: #f0f8ff; padding: 10px; border-radius: 5px; margin-bottom: 20px; }}
-                .result {{ background: #ffffff; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }}
-                .error {{ color: #d32f2f; background: #ffebee; }}
-                .greeting {{ color: #388e3c; background: #e8f5e9; }}
-                h4 {{ color: #1976d2; }}
-                ul {{ padding-left: 20px; }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <div class="query">
-                    <strong>Query:</strong> {q}
-                </div>
-                <div class="result">
-                    {html_content}
-                </div>
-                <div style="margin-top: 20px; text-align: center;">
-                    <a href="/" style="text-decoration: none; background: #1976d2; color: white; padding: 10px 20px; border-radius: 5px;">← Back to API Info</a>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-        return full_html
+        return {
+            "status": "success",
+            "query": q,
+            "parameters": {
+                "max_tokens": max_tokens,
+                "temperature": temperature
+            },
+            "result": result,
+            #"timestamp": datetime.now().isoformat()
+        }
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
-
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "status": "error",
+                "query": q,
+                "error": str(e)
+                # "timestamp": datetime.now().isoformat()
+            }
+        )
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
