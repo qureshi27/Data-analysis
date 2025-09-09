@@ -819,20 +819,27 @@ def overview():
             "avg_scrap_factor_percent": avg_scrap_factor             # plant-wide mean
         }
     })
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import json
 CSV_PATH = os.path.normpath(os.path.join(r"batch_details.csv"))
 
 # Pydantic models
 class QueryRequest(BaseModel):
     query: str
-    max_tokens: Optional[int] = 100
+    max_tokens: Optional[int] = 1000
     temperature: Optional[float] = 0.7
 
 class QueryResponse(BaseModel):
-    html_content: str
     status: str
+    query: str
+    result: str
+    data_insights: Optional[Dict[str, Any]] = None
+    suggested_questions: List[str]
+    parameters: Dict[str, Any]
 
 def load_and_analyze_csv():
-    """Load CSV and return basic info about it"""
+    """Load CSV and return the full dataframe"""
     try:
         df = pd.read_csv(CSV_PATH)
         return df
@@ -840,182 +847,352 @@ def load_and_analyze_csv():
         print(f"Error loading CSV: {e}")
         return None
 
-def get_csv_summary(df):
-    """Get summary information about the CSV"""
+def get_comprehensive_data_analysis(df):
+    """Perform comprehensive analysis of the entire dataset"""
     if df is None:
-        return "Could not load the data file."
+        return None
     
-    summary = {
-        'columns': df.columns.tolist(),
-        'shape': df.shape,
-        'sample_data': df.head(3).to_dict('records') if len(df) > 0 else []
+    analysis = {
+        'basic_info': {
+            'total_records': len(df),
+            'columns': df.columns.tolist(),
+            'shape': df.shape,
+            'memory_usage': df.memory_usage(deep=True).sum()
+        },
+        'column_analysis': {},
+        'data_quality': {
+            'missing_values': df.isnull().sum().to_dict(),
+            'duplicate_rows': df.duplicated().sum(),
+            'data_types': df.dtypes.to_dict()
+        },
+        'sample_data': df.head(5).to_dict('records') if len(df) > 0 else []
     }
-    return summary
+    
+    # Analyze each column
+    for col in df.columns:
+        col_analysis = {
+            'type': str(df[col].dtype),
+            'unique_values': df[col].nunique(),
+            'missing_count': df[col].isnull().sum()
+        }
+        
+        if df[col].dtype in ['int64', 'float64']:
+            col_analysis.update({
+                'min': df[col].min() if not df[col].isnull().all() else None,
+                'max': df[col].max() if not df[col].isnull().all() else None,
+                'mean': df[col].mean() if not df[col].isnull().all() else None,
+                'median': df[col].median() if not df[col].isnull().all() else None,
+                'std': df[col].std() if not df[col].isnull().all() else None
+            })
+        elif df[col].dtype == 'object':
+            value_counts = df[col].value_counts().head(10)
+            col_analysis.update({
+                'top_values': value_counts.to_dict(),
+                'unique_sample': df[col].dropna().unique()[:10].tolist()
+            })
+        
+        analysis['column_analysis'][col] = col_analysis
+    
+    return analysis
+
+def analyze_query_and_extract_data(df, query: str, full_analysis: Dict):
+    """Analyze user query and extract relevant data insights"""
+    query_lower = query.lower().strip()
+    
+    # Extract actual data based on query patterns
+    insights = {}
+    result_data = {}
+    
+    # Count queries
+    if any(word in query_lower for word in ['count', 'number', 'total', 'how many']):
+        if 'batch' in query_lower:
+            insights['total_batches'] = len(df)
+        if 'unique' in query_lower:
+            for col in df.columns:
+                if col.lower() in query_lower:
+                    insights[f'unique_{col}'] = df[col].nunique()
+    
+    # Statistics queries
+    if any(word in query_lower for word in ['average', 'mean', 'avg']):
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if col.lower() in query_lower:
+                insights[f'average_{col}'] = df[col].mean()
+    
+    if any(word in query_lower for word in ['maximum', 'max', 'highest']):
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if col.lower() in query_lower:
+                insights[f'max_{col}'] = df[col].max()
+                insights[f'max_{col}_record'] = df.loc[df[col].idxmax()].to_dict()
+    
+    if any(word in query_lower for word in ['minimum', 'min', 'lowest']):
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            if col.lower() in query_lower:
+                insights[f'min_{col}'] = df[col].min()
+                insights[f'min_{col}_record'] = df.loc[df[col].idxmin()].to_dict()
+    
+    # Top/Bottom queries
+    if 'top' in query_lower:
+        numbers = re.findall(r'\d+', query)
+        n = int(numbers[0]) if numbers else 10
+        
+        # Find relevant sorting column
+        numeric_cols = df.select_dtypes(include=[np.number]).columns
+        sort_col = None
+        for col in numeric_cols:
+            if any(keyword in col.lower() for keyword in ['score', 'value', 'amount', 'price', 'rating']):
+                sort_col = col
+                break
+        
+        if sort_col is None and len(numeric_cols) > 0:
+            sort_col = numeric_cols[0]
+        
+        if sort_col:
+            top_records = df.nlargest(n, sort_col)
+            result_data['top_records'] = top_records.to_dict('records')
+            insights['top_records_count'] = len(top_records)
+    
+    # Filter queries
+    for col in df.columns:
+        if col.lower() in query_lower:
+            unique_values = df[col].value_counts()
+            insights[f'{col}_distribution'] = unique_values.head(10).to_dict()
+    
+    # Group by queries
+    if any(word in query_lower for word in ['group', 'category', 'type', 'by']):
+        categorical_cols = df.select_dtypes(include=['object']).columns
+        for col in categorical_cols[:2]:  # Limit to first 2 categorical columns
+            if len(df[col].unique()) < 20:  # Only group if not too many categories
+                grouped = df.groupby(col).size()
+                insights[f'grouped_by_{col}'] = grouped.to_dict()
+    
+    return insights, result_data
+
+def generate_suggested_questions(df, current_query: str, full_analysis: Dict) -> list[str]:
+    """Generate contextually relevant suggested questions"""
+    suggestions = []
+    
+    # Basic suggestions based on data structure
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    categorical_cols = df.select_dtypes(include=['object']).columns
+    
+    # Query-specific suggestions
+    query_lower = current_query.lower()
+    
+    if 'count' in query_lower or 'total' in query_lower:
+        if len(numeric_cols) > 0:
+            suggestions.extend([
+                f"What's the average {numeric_cols[0]}?",
+                f"Show me the top 10 records by {numeric_cols[0]}"
+            ])
+    elif 'top' in query_lower:
+        suggestions.extend([
+            "What's the distribution of different categories?",
+            "Show me detailed statistics for these top records"
+        ])
+    elif 'average' in query_lower or 'mean' in query_lower:
+        suggestions.extend([
+            f"What are the minimum and maximum values?",
+            "Show me records above the average"
+        ])
+    else:
+        # Default suggestions
+        if len(df) > 0:
+            suggestions.extend([
+                f"How many total records are there?",
+                f"What are the top 10 records?"
+            ])
+        
+        if len(categorical_cols) > 0:
+            suggestions.append(f"Show me the distribution of {categorical_cols[0]}")
+        
+        if len(numeric_cols) > 0:
+            suggestions.append(f"What's the average {numeric_cols[0]}?")
+    
+    # Add data quality suggestions
+    if full_analysis and full_analysis['data_quality']['missing_values']:
+        missing_cols = [col for col, count in full_analysis['data_quality']['missing_values'].items() if count > 0]
+        if missing_cols:
+            suggestions.append(f"Which records have missing {missing_cols[0]}?")
+    
+    # Remove duplicates and limit to 2
+    suggestions = list(dict.fromkeys(suggestions))[:2]
+    
+    # If we don't have enough suggestions, add generic ones
+    while len(suggestions) < 2:
+        generic_suggestions = [
+            "Show me a summary of all columns",
+            "What are the data quality issues?",
+            "Show me some sample records",
+            "What are the different data types in this dataset?"
+        ]
+        for suggestion in generic_suggestions:
+            if suggestion not in suggestions:
+                suggestions.append(suggestion)
+                break
+    
+    return suggestions[:2]
 
 async def process_query(query: str, max_tokens: int = 1000, temperature: float = 0.7):
-    """Process the user query and return HTML response"""
+    """Process the user query and return comprehensive analysis"""
     # Load the CSV data
     df = load_and_analyze_csv()
     
     if df is None:
-        return "<div class='error'><p>Sorry, I couldn't load the data file. Please check if the file exists.</p></div>"
+        return {
+            "html_content": "<div class='error'><p>Sorry, I couldn't load the data file. Please check if the file exists.</p></div>",
+            "data_insights": None,
+            "suggested_questions": ["Check if the data file exists", "Try reloading the data"]
+        }
     
     # Handle greetings
     query_lower = query.lower().strip()
     if query_lower in ['hi', 'hello', 'hey']:
-        return "<div class='greeting'><p>Hello! I'm here to help you analyze your batch data. Feel free to ask me any questions about the data!</p></div>"
+        suggested_questions = generate_suggested_questions(df, query, None)
+        return {
+            "html_content": f"<div class='greeting'><p>Hello! I'm here to help you analyze your batch data with {len(df)} records and {len(df.columns)} columns. Feel free to ask me any questions about the data!</p></div>",
+            "data_insights": {"total_records": len(df), "total_columns": len(df.columns)},
+            "suggested_questions": suggested_questions
+        }
     
-    # Get CSV summary
-    csv_summary = get_csv_summary(df)
+    # Get comprehensive analysis
+    full_analysis = get_comprehensive_data_analysis(df)
     
-    # Create context for OpenAI
+    # Extract specific insights based on query
+    query_insights, result_data = analyze_query_and_extract_data(df, query, full_analysis)
+    
+    # Generate suggested questions
+    suggested_questions = generate_suggested_questions(df, query, full_analysis)
+    
+    # Create context for response generation
     context = f"""
-You are a data analysis assistant. You have access to batch details data with the following structure:
-- Columns: {csv_summary['columns']}
-- Total records: {csv_summary['shape'][0]}
-- Sample data: {csv_summary['sample_data']}
+You are analyzing a dataset with {len(df)} records and {len(df.columns)} columns.
+Columns: {df.columns.tolist()}
 
 User query: {query}
 
+Extracted insights: {json.dumps(query_insights, default=str, indent=2)}
+Result data: {json.dumps(result_data, default=str, indent=2)}
+
 Instructions:
-- Respond in clean HTML format
-- Use <h4> for headings, <p> for paragraphs, <ul> and <li> for lists
-- Be conversational and helpful
-- Don't mention CSV files or file sources
-- For "top candidates" queries, show names and scores (highest first)
-- For "complete details" queries, provide all relevant information
-- Keep HTML lightweight and UI-friendly
-- Use bullet points where appropriate
-- Wrap your response in a <div> container
+- Provide specific, calculated answers based on the actual data
+- Include the exact numbers and insights extracted
+- Be conversational but precise
+- Format response in clean HTML
+- If showing records, format them nicely
+- Don't mention CSV files or technical details
+- Focus on answering the specific question with real data
 """
 
     try:
-        # Query OpenAI
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are an expert data analysis assistant. Always respond in clean HTML format."},
-                {"role": "user", "content": context}
-            ],
-            max_tokens=max_tokens,
-            temperature=temperature
-        )
+        # For now, create a comprehensive response based on the insights
+        html_response = generate_html_response(query, query_insights, result_data, df)
         
-        return response.choices[0].message.content
+        return {
+            "html_content": html_response,
+            "data_insights": query_insights,
+            "suggested_questions": suggested_questions
+        }
         
     except Exception as e:
-        return f"<div class='error'><p>Sorry, I encountered an error while processing your query: {str(e)}</p></div>"
+        return {
+            "html_content": f"<div class='error'><p>Sorry, I encountered an error while processing your query: {str(e)}</p></div>",
+            "data_insights": None,
+            "suggested_questions": ["Try a simpler query", "Check the data format"]
+        }
 
-# @app.get("/", response_class=HTMLResponse)
-# async def root():
-#     """Root endpoint with API information"""
-#     html_content = """
-#     <!DOCTYPE html>
-#     <html>
-#     <head>
-#         <title>Batch Data Query API</title>
-#         <style>
-#             body { font-family: Arial, sans-serif; margin: 40px; }
-#             .container { max-width: 800px; margin: 0 auto; }
-#             .endpoint { background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }
-#             code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; }
-#         </style>
-#     </head>
-#     <body>
-#         <div class="container">
-#             <h1>Batch Data Query API</h1>
-#             <p>Welcome to the Batch Data Query API. This service allows you to query batch details data using natural language.</p>
-            
-#             <h2>Available Endpoints:</h2>
-            
-#             <div class="endpoint">
-#                 <h3>GET /query</h3>
-#                 <p><strong>Description:</strong> Query batch data using URL parameters</p>
-#                 <p><strong>Parameters:</strong></p>
-#                 <ul>
-#                     <li><code>q</code> (required): Your query string</li>
-#                     <li><code>max_tokens</code> (optional): Maximum tokens for response (default: 1000)</li>
-#                     <li><code>temperature</code> (optional): Response creativity (0.0-1.0, default: 0.7)</li>
-#                 </ul>
-#                 <p><strong>Example:</strong> <code>/query?q=What is the total number of batches?</code></p>
-#             </div>
-            
-#             <div class="endpoint">
-#                 <h3>POST /query</h3>
-#                 <p><strong>Description:</strong> Query batch data using JSON payload</p>
-#                 <p><strong>Body:</strong> JSON with query, max_tokens (optional), temperature (optional)</p>
-#                 <p><strong>Example:</strong></p>
-#                 <pre>{"query": "Show me top 5 batches", "max_tokens": 800, "temperature": 0.5}</pre>
-#             </div>
-            
-#             <h2>Sample Queries:</h2>
-#             <ul>
-#                 <li>What is the total number of batches?</li>
-#                 <li>Show me the top 10 batches</li>
-#                 <li>Give me complete details of batch XYZ</li>
-#                 <li>What are the different batch types?</li>
-#             </ul>
-#         </div>
-#     </body>
-#     </html>
-#     """
-#     return html_content
+def generate_html_response(query: str, insights: Dict, result_data: Dict, df: pd.DataFrame):
+    """Generate HTML response based on insights"""
+    html_parts = ["<div class='query-response'>"]
+    
+    query_lower = query.lower()
+    
+    # Handle count queries
+    if 'total_batches' in insights:
+        html_parts.append(f"<p><strong>Total number of batches:</strong> {insights['total_batches']}</p>")
+    
+    # Handle statistics
+    for key, value in insights.items():
+        if 'average_' in key:
+            col_name = key.replace('average_', '')
+            html_parts.append(f"<p><strong>Average {col_name}:</strong> {value:.2f}</p>")
+        elif 'max_' in key and not key.endswith('_record'):
+            col_name = key.replace('max_', '')
+            html_parts.append(f"<p><strong>Maximum {col_name}:</strong> {value}</p>")
+        elif 'min_' in key and not key.endswith('_record'):
+            col_name = key.replace('min_', '')
+            html_parts.append(f"<p><strong>Minimum {col_name}:</strong> {value}</p>")
+    
+    # Handle top records
+    if 'top_records' in result_data:
+        html_parts.append("<h4>Top Records:</h4>")
+        html_parts.append("<div class='records-table'>")
+        records = result_data['top_records']
+        if records:
+            # Create a simple table
+            html_parts.append("<table border='1' style='border-collapse: collapse; width: 100%;'>")
+            # Header
+            html_parts.append("<tr>")
+            for col in records[0].keys():
+                html_parts.append(f"<th style='padding: 8px; background-color: #f2f2f2;'>{col}</th>")
+            html_parts.append("</tr>")
+            # Rows
+            for record in records:
+                html_parts.append("<tr>")
+                for value in record.values():
+                    html_parts.append(f"<td style='padding: 8px;'>{value}</td>")
+                html_parts.append("</tr>")
+            html_parts.append("</table>")
+        html_parts.append("</div>")
+    
+    # Handle distributions
+    for key, value in insights.items():
+        if '_distribution' in key:
+            col_name = key.replace('_distribution', '')
+            html_parts.append(f"<h4>{col_name} Distribution:</h4>")
+            html_parts.append("<ul>")
+            for cat, count in value.items():
+                html_parts.append(f"<li>{cat}: {count}</li>")
+            html_parts.append("</ul>")
+        elif 'grouped_by_' in key:
+            col_name = key.replace('grouped_by_', '')
+            html_parts.append(f"<h4>Grouped by {col_name}:</h4>")
+            html_parts.append("<ul>")
+            for cat, count in value.items():
+                html_parts.append(f"<li>{cat}: {count} records</li>")
+            html_parts.append("</ul>")
+    
+    # If no specific insights were generated, provide general info
+    if len([key for key in insights.keys() if not key.startswith('unique_')]) == 0:
+        html_parts.append(f"<p>I found a dataset with <strong>{len(df)} records</strong> and <strong>{len(df.columns)} columns</strong>.</p>")
+        html_parts.append("<p>Available columns:</p>")
+        html_parts.append("<ul>")
+        for col in df.columns:
+            html_parts.append(f"<li>{col}</li>")
+        html_parts.append("</ul>")
+    
+    html_parts.append("</div>")
+    
+    return "".join(html_parts)
 
-# @app.get("/query", response_class=HTMLResponse)
-# async def query_get(
-#     q: str = Query(..., description="Query string"),
-#     max_tokens: int = Query(1000, description="Maximum tokens for response"),
-#     temperature: float = Query(0.7, description="Response creativity (0.0-1.0)")
-# ):
-#     """Query endpoint using GET method with URL parameters"""
-#     try:
-#         html_content = await process_query(q, max_tokens, temperature)
-        
-#         # Wrap in a complete HTML document for better display
-#         full_html = f"""
-#         <!DOCTYPE html>
-#         <html>
-#         <head>
-#             <title>Query Result</title>
-#             <style>
-#                 body {{ font-family: Arial, sans-serif; margin: 20px; line-height: 1.6; }}
-#                 .container {{ max-width: 800px; margin: 0 auto; }}
-#                 .query {{ background: #f0f8ff; padding: 10px; border-radius: 5px; margin-bottom: 20px; }}
-#                 .result {{ background: #ffffff; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }}
-#                 .error {{ color: #d32f2f; background: #ffebee; }}
-#                 .greeting {{ color: #388e3c; background: #e8f5e9; }}
-#                 h4 {{ color: #1976d2; }}
-#                 ul {{ padding-left: 20px; }}
-#             </style>
-#         </head>
-#         <body>
-#             <div class="container">
-#                 <div class="query">
-#                     <strong>Query:</strong> {q}
-#                 </div>
-#                 <div class="result">
-#                     {html_content}
-#                 </div>
-#                 <div style="margin-top: 20px; text-align: center;">
-#                     <a href="/" style="text-decoration: none; background: #1976d2; color: white; padding: 10px 20px; border-radius: 5px;">← Back to API Info</a>
-#                 </div>
-#             </div>
-#         </body>
-#         </html>
-#         """
-#         return full_html
-        
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
     return {
-        "title": "Batch Data Query API",
-        "description": "This service allows you to query batch details data using natural language.",
+        "title": "Enhanced Batch Data Query API",
+        "description": "This service provides comprehensive analysis of batch details data using natural language queries with structured JSON responses.",
+        "features": [
+            "Real-time data analysis and calculations",
+            "Comprehensive statistical insights",
+            "Contextual suggested questions",
+            "Support for complex queries and filtering",
+            "Data quality analysis"
+        ],
         "endpoints": {
             "GET /query": {
-                "description": "Query batch data using URL parameters",
+                "description": "Query batch data using URL parameters with full data analysis",
                 "parameters": {
                     "q": {"type": "string", "required": True, "description": "Your query string"},
                     "max_tokens": {"type": "integer", "required": False, "default": 1000, "description": "Maximum tokens for response"},
@@ -1024,48 +1201,53 @@ async def root():
                 "example": "/query?q=What is the total number of batches?"
             },
             "POST /query": {
-                "description": "Query batch data using JSON payload",
+                "description": "Query batch data using JSON payload with comprehensive analysis",
                 "body": {
                     "query": {"type": "string", "required": True},
                     "max_tokens": {"type": "integer", "required": False, "default": 1000},
                     "temperature": {"type": "float", "required": False, "default": 0.7}
                 },
                 "example": {
-                    "query": "Show me top 5 batches",
+                    "query": "Show me top 5 batches by score",
                     "max_tokens": 800,
                     "temperature": 0.5
                 }
             }
         },
         "sample_queries": [
-            "What is the total number of batches?",
-            "Show me the top 10 batches",
-            "Give me complete details of batch XYZ",
-            "What are the different batch types?"
+            "How many total batches are there?",
+            "Show me the top 10 batches by score",
+            "What's the average score of all batches?",
+            "Which batch has the highest score?",
+            "Show me the distribution of batch types",
+            "What are the data quality issues?",
+            "Group batches by category",
+            "Show me batches with missing data"
         ]
     }
 
-@app.get("/query")
+@app.get("/query", response_model=QueryResponse)
 async def query_get(
     q: str = Query(..., description="Query string"),
     max_tokens: int = Query(1000, description="Maximum tokens for response"),
     temperature: float = Query(0.7, description="Response creativity (0.0-1.0)")
 ):
-    """Query endpoint using GET method with URL parameters"""
+    """Enhanced query endpoint using GET method with comprehensive data analysis"""
     try:
-        # Process the query (assuming process_query returns plain text or data)
+        # Process the query with full data analysis
         result = await process_query(q, max_tokens, temperature)
         
-        return {
-            "status": "success",
-            "query": q,
-            "parameters": {
+        return QueryResponse(
+            status="success",
+            query=q,
+            result=result["html_content"],
+            data_insights=result.get("data_insights"),
+            suggested_questions=result.get("suggested_questions", []),
+            parameters={
                 "max_tokens": max_tokens,
                 "temperature": temperature
-            },
-            "result": result,
-            #"timestamp": datetime.now().isoformat()
-        }
+            }
+        )
         
     except Exception as e:
         raise HTTPException(
@@ -1073,8 +1255,38 @@ async def query_get(
             detail={
                 "status": "error",
                 "query": q,
-                "error": str(e)
-                # "timestamp": datetime.now().isoformat()
+                "error": str(e),
+                "suggested_questions": ["Try a simpler query", "Check the data file"]
+            }
+        )
+
+@app.post("/query", response_model=QueryResponse)
+async def query_post(request: QueryRequest):
+    """Enhanced query endpoint using POST method with comprehensive data analysis"""
+    try:
+        # Process the query with full data analysis
+        result = await process_query(request.query, request.max_tokens, request.temperature)
+        
+        return QueryResponse(
+            status="success",
+            query=request.query,
+            result=result["html_content"],
+            data_insights=result.get("data_insights"),
+            suggested_questions=result.get("suggested_questions", []),
+            parameters={
+                "max_tokens": request.max_tokens,
+                "temperature": request.temperature
+            }
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail={
+                "status": "error",
+                "query": request.query,
+                "error": str(e),
+                "suggested_questions": ["Try a simpler query", "Check the data file"]
             }
         )
 if __name__ == "__main__":
