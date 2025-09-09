@@ -822,122 +822,202 @@ def overview():
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import json
-CSV_PATH = os.path.normpath(os.path.join(r"batch_details.csv"))
 
-# Pydantic models
-class QueryRequest(BaseModel):
-    query: str
-    max_tokens: Optional[int] = 1000
-    temperature: Optional[float] = 0.7
+# main.py
+import os
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional
 
-class QueryResponse(BaseModel):
-    status: str
-    query: str
-    result: str
-    data_insights: Optional[Dict[str, Any]] = None
-    suggested_questions: list[str]
-    parameters: Dict[str, Any]
+import numpy as np
+import pandas as pd
+from dateutil.relativedelta import relativedelta
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+# If the CSV is in the same folder, this is fine. Otherwise, set an absolute path.
+CSV_PATH = os.path.normpath(os.path.join("batch_details.csv"))
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def to_python(obj):
+    """
+    Recursively convert NumPy/Pandas types to vanilla Python/JSON types.
+    Prevents Pydantic v2 serialization errors.
+    """
+    # Scalars
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+
+    # Datetimes
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    if isinstance(obj, np.datetime64):
+        return pd.to_datetime(obj).isoformat()
+
+    # Missing
+    if obj is None:
+        return None
+    try:
+        if pd.isna(obj):  # catches NaN/NaT
+            return None
+    except Exception:
+        pass
+
+    # Containers
+    if isinstance(obj, pd.Series):
+        return to_python(obj.tolist())
+    if isinstance(obj, (pd.Index,)):
+        return to_python(list(obj))
+    if isinstance(obj, pd.DataFrame):
+        return [to_python(rec) for rec in obj.to_dict(orient="records")]
+    if isinstance(obj, dict):
+        return {str(k): to_python(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_python(x) for x in obj]
+
+    return obj
+
 
 def load_and_analyze_csv():
-    """Load CSV and return the full dataframe"""
+    """Load CSV and return the full dataframe + detected date columns."""
     try:
-        df = pd.read_csv(CSV_PATH)
-        # Try to parse date columns automatically
+        # low_memory=False avoids mixed-type chunk inference warning
+        df = pd.read_csv(CSV_PATH, low_memory=False)
+
+        # Try to parse date-like columns automatically
         date_columns = []
         for col in df.columns:
             if any(word in col.lower() for word in ['date', 'time', 'created', 'updated', 'timestamp']):
                 try:
                     df[col] = pd.to_datetime(df[col], errors='coerce')
                     date_columns.append(col)
-                except:
+                except Exception:
                     pass
+
         return df, date_columns
     except Exception as e:
         print(f"Error loading CSV: {e}")
         return None, []
 
-def get_time_period_filter(df, period: str, date_columns: list):
-    """Get data for specific time period"""
+
+def choose_best_date_col(df: pd.DataFrame, date_columns: list[str]) -> Optional[str]:
+    """Pick the date column with the most non-NA timestamps."""
+    if not date_columns:
+        return None
+    return max(date_columns, key=lambda c: df[c].notna().sum())
+
+
+def get_time_period_filter(df: pd.DataFrame, period: str, date_columns: list[str]) -> pd.DataFrame:
+    """Filter dataframe for a specific time period using the best date column."""
     if not date_columns:
         return df
-    
-    # Use the first date column found
-    date_col = date_columns[0]
+
+    date_col = choose_best_date_col(df, date_columns)
+    if not date_col:
+        return df
+
     current_date = datetime.now()
-    
+
     if 'this month' in period.lower():
         start_date = current_date.replace(day=1)
         return df[df[date_col] >= start_date]
+
     elif 'this quarter' in period.lower():
-        quarter_start = current_date.replace(month=((current_date.month-1)//3)*3+1, day=1)
+        q_start_month = ((current_date.month - 1) // 3) * 3 + 1
+        quarter_start = current_date.replace(month=q_start_month, day=1)
         return df[df[date_col] >= quarter_start]
+
     elif 'this year' in period.lower():
         year_start = current_date.replace(month=1, day=1)
         return df[df[date_col] >= year_start]
+
     elif 'last month' in period.lower():
         last_month = current_date - relativedelta(months=1)
         start_date = last_month.replace(day=1)
         end_date = current_date.replace(day=1) - timedelta(days=1)
-        return df[(df[date_col] >= start_date) & (df[date_col] <= end_date)]
+        mask = (df[date_col] >= start_date) & (df[date_col] <= end_date)
+        return df[mask]
+
     elif 'last quarter' in period.lower():
-        current_quarter = ((current_date.month-1)//3)*3+1
-        if current_quarter == 1:
+        current_q_start_month = ((current_date.month - 1) // 3) * 3 + 1
+        if current_q_start_month == 1:
             last_quarter_start = (current_date - relativedelta(years=1)).replace(month=10, day=1)
         else:
-            last_quarter_start = current_date.replace(month=current_quarter-3, day=1)
-        quarter_start = current_date.replace(month=current_quarter, day=1)
-        return df[(df[date_col] >= last_quarter_start) & (df[date_col] < quarter_start)]
-    
+            last_quarter_start = current_date.replace(month=current_q_start_month - 3, day=1)
+        quarter_start = current_date.replace(month=current_q_start_month, day=1)
+        mask = (df[date_col] >= last_quarter_start) & (df[date_col] < quarter_start)
+        return df[mask]
+
     return df
 
-def find_relevant_columns(df, query: str):
-    """Find columns relevant to the query"""
+
+def is_numeric(series: pd.Series) -> bool:
+    """Robust numeric dtype check."""
+    return pd.api.types.is_numeric_dtype(series)
+
+
+def find_relevant_columns(df: pd.DataFrame, query: str):
+    """Find columns relevant to the query based on keywords and dtypes."""
     query_lower = query.lower()
-    relevant_cols = {}
-    
+    relevant_cols: Dict[str, Any] = {}
+
     # Delay-related columns
     delay_keywords = ['delay', 'late', 'behind', 'overdue', 'slow']
     for col in df.columns:
         col_lower = col.lower()
         if any(keyword in col_lower for keyword in delay_keywords):
             relevant_cols['delay_column'] = col
-    
+            break
+
     # Rate/percentage columns
     rate_keywords = ['rate', 'percent', 'ratio', '%']
     for col in df.columns:
         col_lower = col.lower()
         if any(keyword in col_lower for keyword in rate_keywords):
             relevant_cols['rate_column'] = col
-    
+            break
+
     # Reason columns
     reason_keywords = ['reason', 'cause', 'issue', 'problem', 'type', 'category']
     for col in df.columns:
         col_lower = col.lower()
         if any(keyword in col_lower for keyword in reason_keywords):
             relevant_cols['reason_column'] = col
-    
+            break
+
     # Line/location columns
     line_keywords = ['line', 'location', 'station', 'area', 'zone', 'department']
     for col in df.columns:
         col_lower = col.lower()
         if any(keyword in col_lower for keyword in line_keywords):
             relevant_cols['line_column'] = col
-    
+            break
+
     # Numeric columns for calculations
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     relevant_cols['numeric_columns'] = numeric_cols
-    
+
     return relevant_cols
 
-def analyze_advanced_query(df, query: str, date_columns: list):
-    """Analyze complex queries with time periods and specific metrics"""
+
+def analyze_advanced_query(df: pd.DataFrame, query: str, date_columns: list[str]):
+    """Analyze complex queries with time periods and specific metrics."""
     query_lower = query.lower().strip()
-    insights = {}
-    result_data = {}
-    
-    # Find relevant columns
+    insights: Dict[str, Any] = {}
+    result_data: Dict[str, Any] = {}
+
+    # Relevant columns
     relevant_cols = find_relevant_columns(df, query)
-    
+
     # Time period filtering
     filtered_df = df
     time_periods = ['this month', 'this quarter', 'this year', 'last month', 'last quarter']
@@ -947,126 +1027,131 @@ def analyze_advanced_query(df, query: str, date_columns: list):
             insights['time_period'] = period
             insights['filtered_records'] = len(filtered_df)
             break
-    
+
     # Delay rate calculations
     if any(word in query_lower for word in ['delay rate', 'delay percentage', 'rate']):
-        if 'delay_column' in relevant_cols:
-            delay_col = relevant_cols['delay_column']
-            if delay_col in filtered_df.columns:
-                if filtered_df[delay_col].dtype in ['int64', 'float64']:
-                    # If numeric, calculate average
-                    delay_rate = filtered_df[delay_col].mean()
-                    insights['delay_rate'] = round(delay_rate, 2)
-                else:
-                    # If categorical, calculate percentage of delayed items
-                    delayed_count = filtered_df[delay_col].str.contains('delay|late|behind', case=False, na=False).sum()
-                    total_count = len(filtered_df)
-                    delay_rate = (delayed_count / total_count) * 100 if total_count > 0 else 0
-                    insights['delay_rate'] = round(delay_rate, 2)
-                    insights['delayed_items'] = delayed_count
-                    insights['total_items'] = total_count
+        delay_col = relevant_cols.get('delay_column')
+        if delay_col and delay_col in filtered_df.columns:
+            if is_numeric(filtered_df[delay_col]):
+                # If numeric, calculate mean rate/metric
+                delay_rate = filtered_df[delay_col].mean()
+                insights['delay_rate'] = round(float(delay_rate), 2)
+            else:
+                # If categorical, estimate percentage of delayed items
+                delayed_count = filtered_df[delay_col].astype(str).str.contains(
+                    'delay|late|behind', case=False, na=False
+                ).sum()
+                total_count = len(filtered_df)
+                delay_rate = (delayed_count / total_count) * 100 if total_count > 0 else 0
+                insights['delay_rate'] = round(float(delay_rate), 2)
+                insights['delayed_items'] = int(delayed_count)
+                insights['total_items'] = int(total_count)
         else:
-            # Try to infer delay from other columns
+            # Infer delay mentions across object columns
             delay_indicators = []
             for col in filtered_df.columns:
                 if filtered_df[col].dtype == 'object':
-                    delay_count = filtered_df[col].str.contains('delay|late|behind', case=False, na=False).sum()
+                    delay_count = filtered_df[col].astype(str).str.contains(
+                        'delay|late|behind', case=False, na=False
+                    ).sum()
                     if delay_count > 0:
-                        delay_indicators.append((col, delay_count))
-            
+                        delay_indicators.append((col, int(delay_count)))
+
             if delay_indicators:
-                # Use the column with most delay indicators
                 delay_col, delay_count = max(delay_indicators, key=lambda x: x[1])
                 delay_rate = (delay_count / len(filtered_df)) * 100 if len(filtered_df) > 0 else 0
-                insights['delay_rate'] = round(delay_rate, 2)
+                insights['delay_rate'] = round(float(delay_rate), 2)
                 insights['delay_column_used'] = delay_col
-    
+
     # Top delay reasons
     if any(phrase in query_lower for phrase in ['top delay', 'delay reason', 'main cause']):
         reason_col = relevant_cols.get('reason_column')
         if reason_col and reason_col in filtered_df.columns:
-            # Filter for delay-related entries
-            delay_mask = filtered_df[reason_col].str.contains('delay|late|behind', case=False, na=False)
+            delay_mask = filtered_df[reason_col].astype(str).str.contains(
+                'delay|late|behind', case=False, na=False
+            )
             delay_reasons = filtered_df[delay_mask][reason_col].value_counts()
-            
-            # Extract number from query (e.g., "top 5")
             numbers = re.findall(r'\d+', query)
             n = int(numbers[0]) if numbers else 5
-            
             top_reasons = delay_reasons.head(n)
-            result_data['top_delay_reasons'] = top_reasons.to_dict()
-            insights['total_delay_reasons'] = len(delay_reasons)
+            result_data['top_delay_reasons'] = {str(k): int(v) for k, v in top_reasons.items()}
+            insights['total_delay_reasons'] = int(delay_reasons.size)
         else:
-            # Look for any categorical column that might contain reasons
+            # Try any categorical column that might contain reasons
             categorical_cols = filtered_df.select_dtypes(include=['object']).columns
             for col in categorical_cols:
                 if any(word in col.lower() for word in ['reason', 'cause', 'issue', 'type', 'category', 'problem']):
                     reason_counts = filtered_df[col].value_counts()
                     numbers = re.findall(r'\d+', query)
                     n = int(numbers[0]) if numbers else 5
-                    result_data[f'top_{col.lower()}'] = reason_counts.head(n).to_dict()
+                    result_data[f'top_{col.lower()}'] = {str(k): int(v) for k, v in reason_counts.head(n).items()}
                     break
-    
+
     # Line/location with highest delay
     if any(phrase in query_lower for phrase in ['highest delay', 'most delay', 'worst line']):
         line_col = relevant_cols.get('line_column')
         delay_col = relevant_cols.get('delay_column')
-        
+
         if line_col and line_col in filtered_df.columns:
-            if delay_col and delay_col in filtered_df.columns:
-                if filtered_df[delay_col].dtype in ['int64', 'float64']:
-                    line_delays = filtered_df.groupby(line_col)[delay_col].mean().sort_values(ascending=False)
-                    result_data['line_delay_averages'] = line_delays.to_dict()
-                    insights['highest_delay_line'] = line_delays.index[0] if len(line_delays) > 0 else None
-                    insights['highest_delay_value'] = line_delays.iloc[0] if len(line_delays) > 0 else None
+            if delay_col and delay_col in filtered_df.columns and is_numeric(filtered_df[delay_col]):
+                line_delays = filtered_df.groupby(line_col, dropna=False)[delay_col].mean().sort_values(ascending=False)
+                result_data['line_delay_averages'] = {str(k): float(v) for k, v in line_delays.items()}
+                if len(line_delays) > 0:
+                    insights['highest_delay_line'] = str(line_delays.index[0])
+                    insights['highest_delay_value'] = float(line_delays.iloc[0])
             else:
-                # Count delay mentions by line
+                # Count delay mentions by line across object columns
+                best_counts = None
                 for col in filtered_df.columns:
                     if col != line_col and filtered_df[col].dtype == 'object':
-                        delay_by_line = filtered_df.groupby(line_col)[col].apply(
-                            lambda x: x.str.contains('delay|late|behind', case=False, na=False).sum()
+                        delay_by_line = filtered_df.groupby(line_col, dropna=False)[col].apply(
+                            lambda x: x.astype(str).str.contains('delay|late|behind', case=False, na=False).sum()
                         ).sort_values(ascending=False)
                         if delay_by_line.sum() > 0:
-                            result_data['delay_count_by_line'] = delay_by_line.to_dict()
-                            insights['highest_delay_line'] = delay_by_line.index[0] if len(delay_by_line) > 0 else None
+                            best_counts = delay_by_line
                             break
-    
-    # Average delay by line
+                if best_counts is not None:
+                    result_data['delay_count_by_line'] = {str(k): int(v) for k, v in best_counts.items()}
+                    if len(best_counts) > 0:
+                        insights['highest_delay_line'] = str(best_counts.index[0])
+
+    # Average delay by line (generic)
     if any(phrase in query_lower for phrase in ['average delay', 'mean delay']):
         line_col = relevant_cols.get('line_column')
         numeric_cols = relevant_cols.get('numeric_columns', [])
-        
+
         if line_col and line_col in filtered_df.columns and numeric_cols:
             for num_col in numeric_cols:
                 if any(word in num_col.lower() for word in ['delay', 'time', 'duration', 'minutes', 'hours']):
-                    line_averages = filtered_df.groupby(line_col)[num_col].mean().sort_values(ascending=False)
-                    result_data['average_by_line'] = line_averages.to_dict()
+                    line_averages = filtered_df.groupby(line_col, dropna=False)[num_col].mean().sort_values(ascending=False)
+                    result_data['average_by_line'] = {str(k): float(v) for k, v in line_averages.items()}
                     insights['metric_used'] = num_col
                     break
-    
-    # General statistics
+
+    # General statistics fallback
     if not insights and not result_data:
-        # Provide general insights about the filtered data
-        insights['total_records'] = len(filtered_df)
-        insights['columns_available'] = filtered_df.columns.tolist()
-        
-        # Try to find any delay-related information
+        insights['total_records'] = int(len(filtered_df))
+        insights['columns_available'] = [str(c) for c in filtered_df.columns]
+
+        # Any delay mentions, broadly
         for col in filtered_df.columns:
             if filtered_df[col].dtype == 'object':
-                delay_count = filtered_df[col].str.contains('delay|late|behind', case=False, na=False).sum()
+                delay_count = filtered_df[col].astype(str).str.contains(
+                    'delay|late|behind', case=False, na=False
+                ).sum()
                 if delay_count > 0:
-                    insights[f'delay_mentions_in_{col}'] = delay_count
-    
+                    insights[f'delay_mentions_in_{col}'] = int(delay_count)
+
     return insights, result_data, filtered_df
 
-def generate_suggested_questions(df, current_query: str, insights: Dict, date_columns: list) -> list[str]:
-    """Generate contextually relevant suggested questions based on data and query"""
-    suggestions = []
+
+def generate_suggested_questions(df: pd.DataFrame, current_query: str, insights: Dict, date_columns: list[str]) -> list[str]:
+    """Generate contextually relevant suggested questions based on data and query."""
+    suggestions: list[str] = []
     query_lower = current_query.lower()
-    
-    # Find available columns
+
     relevant_cols = find_relevant_columns(df, current_query)
-    
+
     # Time-based suggestions
     if date_columns:
         if 'this month' in query_lower:
@@ -1075,7 +1160,7 @@ def generate_suggested_questions(df, current_query: str, insights: Dict, date_co
             suggestions.append("How does this compare to last quarter?")
         else:
             suggestions.append("What is the delay rate this month?")
-    
+
     # Delay-specific suggestions
     if 'delay rate' in query_lower:
         suggestions.extend([
@@ -1093,91 +1178,42 @@ def generate_suggested_questions(df, current_query: str, insights: Dict, date_co
             "What is the delay trend over time?"
         ])
     else:
-        # Default suggestions based on available data
         if relevant_cols.get('delay_column'):
             suggestions.append("What is the delay rate this month?")
         if relevant_cols.get('reason_column'):
             suggestions.append("Show top delay reasons this quarter")
         if relevant_cols.get('line_column'):
             suggestions.append("Which line has the highest average delay?")
-        
-        # Add time-based suggestions if date columns exist
         if date_columns:
             suggestions.append("How do delays compare month over month?")
-    
-    # Ensure we have at least 2 suggestions
+
+    # Ensure at least 2
     generic_suggestions = [
         "Show me data quality issues",
         "What are the main categories in the data?",
         "Show me the distribution of records by time",
         "What are the key performance indicators?"
     ]
-    
     for suggestion in generic_suggestions:
         if len(suggestions) >= 2:
             break
         if suggestion not in suggestions:
             suggestions.append(suggestion)
-    
+
     return suggestions[:2]
 
-async def process_query(query: str, max_tokens: int = 1000, temperature: float = 0.7):
-    """Process the user query and return comprehensive analysis"""
-    # Load the CSV data
-    df_result = load_and_analyze_csv()
-    if df_result[0] is None:
-        return {
-            "html_content": "<div class='error'><p>Sorry, I couldn't load the data file. Please check if the file exists.</p></div>",
-            "data_insights": None,
-            "suggested_questions": ["Check if the data file exists", "Try reloading the data"]
-        }
-    
-    df, date_columns = df_result
-    
-    # Handle greetings
-    query_lower = query.lower().strip()
-    if query_lower in ['hi', 'hello', 'hey']:
-        suggested_questions = generate_suggested_questions(df, query, {}, date_columns)
-        return {
-            "html_content": f"<div class='greeting'><p>Hello! I'm here to help you analyze your data with {len(df)} records and {len(df.columns)} columns. I can help with delay analysis, time-based queries, and more!</p></div>",
-            "data_insights": convert_numpy_types({"total_records": len(df), "total_columns": len(df.columns), "date_columns": date_columns}),
-            "suggested_questions": suggested_questions
-        }
-    
-    # Analyze the query with advanced pattern matching
-    query_insights, result_data, filtered_df = analyze_advanced_query(df, query, date_columns)
-    
-    # Generate suggested questions
-    suggested_questions = generate_suggested_questions(df, query, query_insights, date_columns)
-    
-    try:
-        # Generate HTML response
-        html_response = generate_advanced_html_response(query, query_insights, result_data, df, filtered_df)
-        
-        return {
-            "html_content": html_response,
-            "data_insights": query_insights,
-            "suggested_questions": suggested_questions
-        }
-        
-    except Exception as e:
-        return {
-            "html_content": f"<div class='error'><p>Sorry, I encountered an error while processing your query: {str(e)}</p></div>",
-            "data_insights": None,
-            "suggested_questions": ["Try a simpler query", "Check the data format"]
-        }
 
-def generate_advanced_html_response(query: str, insights: Dict, result_data: Dict, original_df: pd.DataFrame, filtered_df: pd.DataFrame):
-    """Generate HTML response based on advanced insights"""
+def generate_advanced_html_response(query: str, insights: Dict, result_data: Dict,
+                                    original_df: pd.DataFrame, filtered_df: pd.DataFrame) -> str:
+    """Generate HTML response based on advanced insights."""
     html_parts = ["<div class='query-response'>"]
-    
     query_lower = query.lower()
-    
+
     # Show time period if filtered
     if 'time_period' in insights:
         html_parts.append(f"<p><em>Analysis for: {insights['time_period']}</em></p>")
         html_parts.append(f"<p>Records in this period: <strong>{insights['filtered_records']}</strong> out of {len(original_df)} total</p>")
-    
+
     # Handle delay rate
     if 'delay_rate' in insights:
         html_parts.append(f"<p><strong>Delay Rate:</strong> {insights['delay_rate']}%</p>")
@@ -1185,7 +1221,7 @@ def generate_advanced_html_response(query: str, insights: Dict, result_data: Dic
             html_parts.append(f"<p>({insights['delayed_items']} delayed items out of {insights['total_items']} total)</p>")
         if 'delay_column_used' in insights:
             html_parts.append(f"<p><em>Based on analysis of: {insights['delay_column_used']}</em></p>")
-    
+
     # Handle top delay reasons
     if 'top_delay_reasons' in result_data:
         html_parts.append("<h4>Top Delay Reasons:</h4>")
@@ -1193,8 +1229,8 @@ def generate_advanced_html_response(query: str, insights: Dict, result_data: Dic
         for reason, count in result_data['top_delay_reasons'].items():
             html_parts.append(f"<p>• <strong>{reason}:</strong> {count} occurrences</p>")
         html_parts.append("</div>")
-    
-    # Handle other top categories
+
+    # Other top categories
     for key, data in result_data.items():
         if key.startswith('top_') and key != 'top_delay_reasons':
             category_name = key.replace('top_', '').replace('_', ' ').title()
@@ -1203,78 +1239,153 @@ def generate_advanced_html_response(query: str, insights: Dict, result_data: Dic
             for item, count in data.items():
                 html_parts.append(f"<li><strong>{item}:</strong> {count}</li>")
             html_parts.append("</ul>")
-    
-    # Handle line delay analysis
+
+    # Line with highest delay
     if 'highest_delay_line' in insights:
         html_parts.append(f"<p><strong>Line with Highest Delay:</strong> {insights['highest_delay_line']}</p>")
-        if 'highest_delay_value' in insights:
-            html_parts.append(f"<p><strong>Average Delay:</strong> {insights['highest_delay_value']:.2f}</p>")
-    
-    # Handle line averages
+        if 'highest_delay_value' in insights and insights['highest_delay_value'] is not None:
+            html_parts.append(f"<p><strong>Average Delay:</strong> {float(insights['highest_delay_value']):.2f}</p>")
+
+    # Average delay by line table
     if 'line_delay_averages' in result_data:
         html_parts.append("<h4>Average Delay by Line:</h4>")
         html_parts.append("<table border='1' style='border-collapse: collapse; width: 100%;'>")
-        html_parts.append("<tr><th style='padding: 8px; background-color: #f2f2f2;'>Line</th><th style='padding: 8px; background-color: #f2f2f2;'>Average Delay</th></tr>")
+        html_parts.append("<tr><th style='padding: 8px; background-color: #f2f2f2;'>Line</th>"
+                          "<th style='padding: 8px; background-color: #f2f2f2;'>Average Delay</th></tr>")
         for line, avg_delay in result_data['line_delay_averages'].items():
-            html_parts.append(f"<tr><td style='padding: 8px;'>{line}</td><td style='padding: 8px;'>{avg_delay:.2f}</td></tr>")
+            html_parts.append(f"<tr><td style='padding: 8px;'>{line}</td><td style='padding: 8px;'>{float(avg_delay):.2f}</td></tr>")
         html_parts.append("</table>")
-    
+
+    # Generic average by line table
     if 'average_by_line' in result_data:
         metric_name = insights.get('metric_used', 'Value')
         html_parts.append(f"<h4>Average {metric_name} by Line:</h4>")
         html_parts.append("<table border='1' style='border-collapse: collapse; width: 100%;'>")
-        html_parts.append(f"<tr><th style='padding: 8px; background-color: #f2f2f2;'>Line</th><th style='padding: 8px; background-color: #f2f2f2;'>Average {metric_name}</th></tr>")
+        html_parts.append(f"<tr><th style='padding: 8px; background-color: #f2f2f2;'>Line</th>"
+                          f"<th style='padding: 8px; background-color: #f2f2f2;'>Average {metric_name}</th></tr>")
         for line, avg_value in result_data['average_by_line'].items():
-            html_parts.append(f"<tr><td style='padding: 8px;'>{line}</td><td style='padding: 8px;'>{avg_value:.2f}</td></tr>")
+            html_parts.append(f"<tr><td style='padding: 8px;'>{line}</td><td style='padding: 8px;'>{float(avg_value):.2f}</td></tr>")
         html_parts.append("</table>")
-    
-    # Handle delay count by line
+
+    # Delay count by line list
     if 'delay_count_by_line' in result_data:
         html_parts.append("<h4>Delay Count by Line:</h4>")
         html_parts.append("<ul>")
         for line, count in result_data['delay_count_by_line'].items():
             html_parts.append(f"<li><strong>{line}:</strong> {count} delays</li>")
         html_parts.append("</ul>")
-    
-    # Show general delay mentions if found
-    delay_mentions = {k: v for k, v in insights.items() if k.startswith('delay_mentions_in_')}
-    if delay_mentions:
-        html_parts.append("<h4>Delay Mentions Found:</h4>")
-        for key, count in delay_mentions.items():
-            column_name = key.replace('delay_mentions_in_', '')
-            html_parts.append(f"<p>• {column_name}: {count} mentions</p>")
-    
-    # If no specific analysis was possible, show available data info
-    if not any(key in result_data for key in ['top_delay_reasons', 'line_delay_averages', 'average_by_line']) and 'delay_rate' not in insights:
-        html_parts.append(f"<p>I found a dataset with <strong>{len(filtered_df)} records</strong> (filtered) out of {len(original_df)} total records.</p>")
+
+    # General info if nothing specific
+    has_specific = any(k in result_data for k in ['top_delay_reasons', 'line_delay_averages', 'average_by_line']) or ('delay_rate' in insights)
+    if not has_specific:
+        html_parts.append(f"<p>I found a dataset with <strong>{len(filtered_df)}</strong> filtered records "
+                          f"out of {len(original_df)} total records.</p>")
         html_parts.append("<p><strong>Available columns:</strong></p>")
         html_parts.append("<ul>")
         for col in filtered_df.columns:
             html_parts.append(f"<li>{col} ({filtered_df[col].dtype})</li>")
         html_parts.append("</ul>")
-        
-        # Show some sample data
+
         if len(filtered_df) > 0:
             html_parts.append("<h4>Sample Data:</h4>")
             sample_data = filtered_df.head(3)
             html_parts.append("<table border='1' style='border-collapse: collapse; width: 100%;'>")
+            # header
             html_parts.append("<tr>")
             for col in sample_data.columns:
                 html_parts.append(f"<th style='padding: 8px; background-color: #f2f2f2;'>{col}</th>")
             html_parts.append("</tr>")
+            # rows
             for _, row in sample_data.iterrows():
                 html_parts.append("<tr>")
                 for value in row:
                     html_parts.append(f"<td style='padding: 8px;'>{value}</td>")
                 html_parts.append("</tr>")
             html_parts.append("</table>")
-    
+
     html_parts.append("</div>")
     return "".join(html_parts)
 
+# -----------------------------------------------------------------------------
+# FastAPI models & app
+# -----------------------------------------------------------------------------
+class QueryRequest(BaseModel):
+    query: str
+    max_tokens: Optional[int] = 100
+    temperature: Optional[float] = 0.7
+
+
+class QueryResponse(BaseModel):
+    status: str
+    query: str
+    result: str
+    data_insights: Optional[Dict[str, Any]] = None
+    suggested_questions: list[str]
+    parameters: Dict[str, Any]
+
+
+# app = FastAPI(title="Enhanced Delay Analysis API")
+
+
+# -----------------------------------------------------------------------------
+# Core processing
+# -----------------------------------------------------------------------------
+async def process_query(query: str, max_tokens: int = 1000, temperature: float = 0.7):
+    """Process the user query and return comprehensive analysis."""
+    df_result = load_and_analyze_csv()
+    if df_result[0] is None:
+        return {
+            "html_content": "<div class='error'><p>Sorry, I couldn't load the data file. Please check if the file exists.</p></div>",
+            "data_insights": None,
+            "suggested_questions": ["Check if the data file exists", "Try reloading the data"]
+        }
+
+    df, date_columns = df_result
+
+    # Greetings
+    query_lower = query.lower().strip()
+    if query_lower in ['hi', 'hello', 'hey']:
+        suggested_questions = generate_suggested_questions(df, query, {}, date_columns)
+        return {
+            "html_content": (
+                f"<div class='greeting'><p>Hello! I'm here to help you analyze your data with "
+                f"{len(df)} records and {len(df.columns)} columns. I can help with delay analysis, "
+                f"time-based queries, and more!</p></div>"
+            ),
+            "data_insights": to_python({
+                "total_records": len(df),
+                "total_columns": len(df.columns),
+                "date_columns": date_columns
+            }),
+            "suggested_questions": to_python(suggested_questions)
+        }
+
+    # Advanced analysis
+    query_insights, result_data, filtered_df = analyze_advanced_query(df, query, date_columns)
+
+    # Suggestions
+    suggested_questions = generate_suggested_questions(df, query, query_insights, date_columns)
+
+    try:
+        html_response = generate_advanced_html_response(query, query_insights, result_data, df, filtered_df)
+        return {
+            "html_content": html_response,
+            "data_insights": to_python(query_insights),          # sanitize for Pydantic
+            "suggested_questions": to_python(suggested_questions)
+        }
+    except Exception as e:
+        return {
+            "html_content": f"<div class='error'><p>Sorry, I encountered an error while processing your query: {str(e)}</p></div>",
+            "data_insights": None,
+            "suggested_questions": ["Try a simpler query", "Check the data format"]
+        }
+
+# -----------------------------------------------------------------------------
+# Routes
+# -----------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    """Root endpoint with API information"""
+    """Root endpoint with API information."""
     return {
         "title": "Enhanced Delay Analysis API",
         "description": "Advanced analysis of batch/operational data with focus on delay analysis, time-based queries, and performance metrics.",
@@ -1309,31 +1420,30 @@ async def root():
         ]
     }
 
+
 @app.get("/query", response_model=QueryResponse)
 async def query_get(
     q: str = Query(..., description="Query string"),
     max_tokens: int = Query(1000, description="Maximum tokens for response"),
     temperature: float = Query(0.7, description="Response creativity (0.0-1.0)")
 ):
-    """Enhanced query endpoint with advanced delay analysis capabilities"""
+    """Enhanced query endpoint with advanced delay analysis capabilities."""
     try:
         result = await process_query(q, max_tokens, temperature)
-        
         return QueryResponse(
             status="success",
             query=q,
             result=result["html_content"],
-            data_insights=result.get("data_insights"),
-            suggested_questions=result.get("suggested_questions", []),
+            data_insights=to_python(result.get("data_insights")),
+            suggested_questions=to_python(result.get("suggested_questions", [])),
             parameters={
                 "max_tokens": max_tokens,
                 "temperature": temperature
             }
         )
-        
     except Exception as e:
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail={
                 "status": "error",
                 "query": q,
@@ -1342,27 +1452,26 @@ async def query_get(
             }
         )
 
+
 @app.post("/query", response_model=QueryResponse)
 async def query_post(request: QueryRequest):
-    """Enhanced query endpoint using POST method with advanced delay analysis"""
+    """Enhanced query endpoint using POST method with advanced delay analysis."""
     try:
         result = await process_query(request.query, request.max_tokens, request.temperature)
-        
         return QueryResponse(
             status="success",
             query=request.query,
             result=result["html_content"],
-            data_insights=result.get("data_insights"),
-            suggested_questions=result.get("suggested_questions", []),
+            data_insights=to_python(result.get("data_insights")),
+            suggested_questions=to_python(result.get("suggested_questions", [])),
             parameters={
                 "max_tokens": request.max_tokens,
                 "temperature": request.temperature
             }
         )
-        
     except Exception as e:
         raise HTTPException(
-            status_code=500, 
+            status_code=500,
             detail={
                 "status": "error",
                 "query": request.query,
